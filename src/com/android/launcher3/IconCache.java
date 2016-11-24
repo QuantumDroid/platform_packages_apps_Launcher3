@@ -56,6 +56,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.Stack;
 
@@ -68,6 +69,14 @@ public class IconCache {
 
     private static final int INITIAL_ICON_CACHE_CAPACITY = 50;
 
+    private static final String RESOURCE_FILE_PREFIX = "icon_";
+
+    public static final String TETHER_SETTINGS_CLASS_NAME =
+            "com.qualcomm.qti.shortcutspringboard.HotSpotShortcut";
+
+    private final String STK_PACKAGE_NAME = "com.android.stk";
+    private final String CHROME_PACKAGE_NAME = "com.android.chrome";
+
     // Empty class name is used for storing package default entry.
     private static final String EMPTY_CLASS_NAME = ".";
 
@@ -75,7 +84,13 @@ public class IconCache {
 
     private static final int LOW_RES_SCALE_FACTOR = 5;
 
+    private final String BROWSER_PACKAGE_NAME = "com.android.browser";
+
     @Thunk static final Object ICON_UPDATE_TOKEN = new Object();
+
+    private Map mUnreadMap;
+
+    private boolean mAppIconReloaded = false;
 
     @Thunk static class CacheEntry {
         public Bitmap icon;
@@ -434,7 +449,7 @@ public class IconCache {
             LauncherActivityInfoCompat info, boolean useLowResIcon) {
         UserHandleCompat user = info == null ? application.user : info.getUser();
         CacheEntry entry = cacheLocked(application.componentName, info, user,
-                false, useLowResIcon);
+                false, useLowResIcon, application.unreadNum);
         application.title = Utilities.trim(entry.title);
         application.iconBitmap = getNonNullIcon(entry, user);
         application.contentDescription = entry.contentDescription;
@@ -446,13 +461,41 @@ public class IconCache {
      */
     public synchronized void updateTitleAndIcon(AppInfo application) {
         CacheEntry entry = cacheLocked(application.componentName, null, application.user,
-                false, application.usingLowResIcon);
+                false, application.usingLowResIcon, application.unreadNum);
         if (entry.icon != null && !isDefaultIcon(entry.icon, application.user)) {
             application.title = Utilities.trim(entry.title);
             application.iconBitmap = entry.icon;
             application.contentDescription = entry.contentDescription;
             application.usingLowResIcon = entry.isLowResIcon;
         }
+    }
+
+    private Bitmap getCustomizedIcon() {
+        Resources res = mContext.getResources();
+        Bitmap bitmap = BitmapFactory.decodeResource(res, R.drawable.customize_browser_icon);
+        return bitmap;
+    }
+
+    private void setCustomizedIconAndTitle(LauncherActivityInfoCompat info, CacheEntry entry) {
+        if (info != null) {
+            setCustomizedIconAndTitle(info.getComponentName().toString().trim(), entry);
+        }
+    }
+
+    private void setCustomizedIconAndTitle(String packagename, CacheEntry entry) {
+        boolean iscustomizechrome = false;
+        if (packagename != null) {
+            iscustomizechrome = packagename.contains(BROWSER_PACKAGE_NAME);
+        }
+        if (iscustomizechrome) {
+            entry.icon = getCustomizedIcon();
+            entry.title = getCustomizedTitle();
+        }
+    }
+
+    private String getCustomizedTitle() {
+        return mContext.getResources().getString(
+                R.string.config_regional_customize_default_browser_title);
     }
 
     /**
@@ -467,7 +510,7 @@ public class IconCache {
         }
 
         LauncherActivityInfoCompat launcherActInfo = mLauncherApps.resolveActivity(intent, user);
-        CacheEntry entry = cacheLocked(component, launcherActInfo, user, true, false /* useLowRes */);
+        CacheEntry entry = cacheLocked(component, launcherActInfo, user, true, false /* useLowRes */, -1);
         return entry.icon;
     }
 
@@ -497,11 +540,34 @@ public class IconCache {
     public synchronized void getTitleAndIcon(
             ShortcutInfo shortcutInfo, ComponentName component, LauncherActivityInfoCompat info,
             UserHandleCompat user, boolean usePkgIcon, boolean useLowResIcon) {
-        CacheEntry entry = cacheLocked(component, info, user, usePkgIcon, useLowResIcon);
+        CacheEntry entry = cacheLocked(component, info, user, usePkgIcon, useLowResIcon,
+                getUnreadNumber(component));
         shortcutInfo.setIcon(getNonNullIcon(entry, user));
         shortcutInfo.title = Utilities.trim(entry.title);
         shortcutInfo.usingFallbackIcon = isDefaultIcon(entry.icon, user);
         shortcutInfo.usingLowResIcon = entry.isLowResIcon;
+    }
+
+    public void setUnreadMap(Map unreadAppMap) {
+        mUnreadMap = unreadAppMap;
+    }
+
+    private int getUnreadNumber(ComponentName componentName){
+        int unreadNumber = -1;
+        if(mAppIconReloaded){
+            if(mUnreadMap != null && mUnreadMap.containsKey(componentName)) {
+                unreadNumber = (int) mUnreadMap.get(componentName);
+            }
+        }
+        return unreadNumber;
+    }
+
+    public void setAppIconReloaded(boolean enable) {
+        mAppIconReloaded = enable;
+    }
+
+    public boolean getAppIconReload() {
+        return mAppIconReloaded;
     }
 
     /**
@@ -533,18 +599,18 @@ public class IconCache {
      * This method is not thread safe, it must be called from a synchronized method.
      */
     private CacheEntry cacheLocked(ComponentName componentName, LauncherActivityInfoCompat info,
-            UserHandleCompat user, boolean usePackageIcon, boolean useLowResIcon) {
+            UserHandleCompat user, boolean usePackageIcon, boolean useLowResIcon, int unreadNum) {
         ComponentKey cacheKey = new ComponentKey(componentName, user);
         CacheEntry entry = mCache.get(cacheKey);
-        if (entry == null || (entry.isLowResIcon && !useLowResIcon)) {
+        if (entry == null || (entry.isLowResIcon && !useLowResIcon) || unreadNum >= 0) {
             entry = new CacheEntry();
             mCache.put(cacheKey, entry);
 
             // Check the DB first.
-            if (!getEntryFromDB(cacheKey, entry, useLowResIcon)) {
+            if (!getEntryFromDB(cacheKey, entry, useLowResIcon) || unreadNum >= 0) {
                 if (info != null) {
                     entry.icon = Utilities.createBadgedIconBitmap(
-                            info.getIcon(mIconDpi), info.getUser(), mContext);
+                            info.getIcon(mIconDpi), info.getUser(), mContext, unreadNum);
                 } else {
                     if (usePackageIcon) {
                         CacheEntry packageEntry = getEntryForPackageLocked(
@@ -568,6 +634,17 @@ public class IconCache {
             if (TextUtils.isEmpty(entry.title) && info != null) {
                 entry.title = info.getLabel();
                 entry.contentDescription = mUserManager.getBadgedLabelForUser(entry.title, user);
+            }
+        }
+        if(LauncherAppState.isCustomizeBrowserIcon()) {
+            setCustomizedIconAndTitle(info, entry);
+        }
+        if (LauncherAppState.isConfigTetherHotspotShortcut()) {
+            if (TETHER_SETTINGS_CLASS_NAME.equals(componentName.getClassName())) {
+                entry.icon = Utilities.createIconBitmap(mContext.getResources().getDrawable(
+                        R.drawable.ic_launcher_hotspot), mContext);
+                entry.title = mContext.getResources().getString(
+                        R.string.hotspot_app_name);
             }
         }
         return entry;
@@ -701,6 +778,9 @@ public class IconCache {
                 } else {
                     entry.contentDescription = mUserManager.getBadgedLabelForUser(
                             entry.title, cacheKey.user);
+                }
+                if(LauncherAppState.isCustomizeBrowserIcon()) {
+                    setCustomizedIconAndTitle(cacheKey.componentName.flattenToString(), entry);
                 }
                 return true;
             }

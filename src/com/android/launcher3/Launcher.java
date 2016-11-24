@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2016 The Linux Foundation. All rights reserved.
  * Copyright (C) 2008 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +30,9 @@ import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.app.AlertDialog;
+import android.app.Notification;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.SearchManager;
 import android.appwidget.AppWidgetHostView;
 import android.appwidget.AppWidgetManager;
@@ -42,11 +46,13 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.IntentSender;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.ResolveInfo;
 import android.content.res.Configuration;
 import android.database.sqlite.SQLiteDatabase;
 import android.graphics.Bitmap;
@@ -57,16 +63,26 @@ import android.graphics.PorterDuff;
 import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Message;
+import android.os.RemoteException;
 import android.os.StrictMode;
 import android.os.SystemClock;
 import android.os.UserHandle;
+import android.provider.Settings;
+import android.telephony.CellInfo;
+import android.telephony.PhoneNumberUtils;
+import android.telephony.PhoneStateListener;
+import android.telephony.SignalStrength;
+import android.telephony.TelephonyManager;
 import android.text.Selection;
 import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
@@ -97,12 +113,14 @@ import android.widget.Toast;
 import com.android.launcher3.DropTarget.DragObject;
 import com.android.launcher3.PagedView.PageSwitchListener;
 import com.android.launcher3.allapps.AllAppsContainerView;
+import com.android.launcher3.allapps.AllAppsGridAdapter;
 import com.android.launcher3.allapps.DefaultAppSearchController;
 import com.android.launcher3.compat.AppWidgetManagerCompat;
 import com.android.launcher3.compat.LauncherActivityInfoCompat;
 import com.android.launcher3.compat.LauncherAppsCompat;
 import com.android.launcher3.compat.UserHandleCompat;
 import com.android.launcher3.compat.UserManagerCompat;
+import com.android.launcher3.hideapp.HideAppInfo;
 import com.android.launcher3.model.WidgetsModel;
 import com.android.launcher3.util.ComponentKey;
 import com.android.launcher3.util.LongArrayMap;
@@ -118,6 +136,7 @@ import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.Serializable;
 import java.text.DateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -127,6 +146,10 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.qti.launcherunreadservice.IGetUnreadNumber;
 /**
  * Default launcher application.
  */
@@ -176,10 +199,16 @@ public class Launcher extends Activity
     static final String INTENT_EXTRA_IGNORE_LAUNCH_ANIMATION =
             "com.android.launcher3.intent.extra.shortcut.INGORE_LAUNCH_ANIMATION";
 
+    //Intent broadcasted when the device screen switches to idle(home screen)
+    public static final String CAT_IDLE_SCREEN_ACTION =
+            "org.codeaurora.action.stk.idle_screen";
+
     // Type: int
     private static final String RUNTIME_STATE_CURRENT_SCREEN = "launcher.current_screen";
     // Type: int
     private static final String RUNTIME_STATE = "launcher.state";
+    // Type: boolean
+    private static final String RUNTIME_STATE_HIDE_APP_MODE="launcher.hide_app";
     // Type: int
     private static final String RUNTIME_STATE_PENDING_ADD_CONTAINER = "launcher.add_container";
     // Type: int
@@ -198,6 +227,16 @@ public class Launcher extends Activity
     private static final String RUNTIME_STATE_PENDING_ADD_WIDGET_INFO = "launcher.add_widget_info";
     // Type: parcelable
     private static final String RUNTIME_STATE_PENDING_ADD_WIDGET_ID = "launcher.add_widget_id";
+    // Type: parcelable
+    private static final String RUNTIME_STATE_HIDE_APPS_INFO = "launcher.hide_apps_info";
+
+    private boolean restoreFromHideMode = false;
+    private List<HideAppInfo> mHideApps = new ArrayList<HideAppInfo>();
+
+    private static final String LAUNCHER_UNREAD_SERVICE_PACKAGENAME =
+            "com.qti.launcherunreadservice";
+    private static final String LAUNCHER_UNREAD_SERVICE_CLASSNAME =
+            "com.qti.launcherunreadservice.LauncherUnreadService";
 
     static final String INTRO_SCREEN_DISMISSED = "launcher.intro_screen_dismissed";
     static final String FIRST_RUN_ACTIVITY_DISPLAYED = "launcher.first_run_activity_displayed";
@@ -228,6 +267,12 @@ public class Launcher extends Activity
     private static int NEW_APPS_PAGE_MOVE_DELAY = 500;
     private static int NEW_APPS_ANIMATION_INACTIVE_TIMEOUT_SECONDS = 5;
     @Thunk static int NEW_APPS_ANIMATION_DELAY = 500;
+
+    private static final int NOTIFICATION_WIFI_CALL_ID = 1;
+    private static final int PERMISSION_REQUEST_CODE_LOCATION = 2;
+    private static final String WIFI_CALL_TURNON = "wifi_call_turnon";
+    private static final int WIFI_CALL_TURN_OFF = 0;
+    private static final int SIGNAL_STRENGTH_POOR = 1;
 
     private final BroadcastReceiver mCloseSystemDialogsReceiver
             = new CloseSystemDialogsIntentReceiver();
@@ -347,6 +392,13 @@ public class Launcher extends Activity
     // the press state and keep this reference to reset the press state when we return to launcher.
     private BubbleTextView mWaitingForResume;
 
+    private TelephonyManager mTelephonyManager;
+    private SignalStrengthListener mSignalStrengthListener;
+    private boolean mIsNotificationPopNeeded = false;
+
+    private Context mContext;
+    private ArrayList<Long> mEmptyScreenList;
+
     protected static HashMap<String, CustomAppWidget> sCustomAppWidgets =
             new HashMap<String, CustomAppWidget>();
 
@@ -388,6 +440,27 @@ public class Launcher extends Activity
                     ActivityInfo.SCREEN_ORIENTATION_NOSENSOR);
         }
     }
+
+    private Map mUnreadAppMap = new HashMap<ComponentName, Integer>();
+    private ServiceConnection mConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            IGetUnreadNumber iGetUnreadNumber = IGetUnreadNumber.Stub.asInterface(service);
+
+            try {
+                if(iGetUnreadNumber != null){
+                    mUnreadAppMap = iGetUnreadNumber.GetUnreadNumber();
+                }
+            } catch (RemoteException ex) {
+            }
+
+            mIconCache.setUnreadMap(mUnreadAppMap);
+            unbindService(mConnection);
+        }
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+        }
+    };
 
     private Runnable mUpdateOrientationRunnable = new Runnable() {
         public void run() {
@@ -446,6 +519,9 @@ public class Launcher extends Activity
         // this also ensures that any synchronous binding below doesn't re-trigger another
         // LauncherModel load.
         mPaused = false;
+
+        mContext = this;
+        mEmptyScreenList = new ArrayList<Long>();
 
         if (PROFILE_STARTUP) {
             android.os.Debug.startMethodTracing(
@@ -507,6 +583,23 @@ public class Launcher extends Activity
         } else {
             showFirstRunActivity();
             showFirstRunClings();
+        }
+
+        if (LauncherAppState.isShowWFCNotification()) {
+            mTelephonyManager = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+            mSignalStrengthListener = new SignalStrengthListener();
+            mTelephonyManager.listen(mSignalStrengthListener,
+                    PhoneStateListener.LISTEN_SIGNAL_STRENGTHS);
+        }
+
+        if(mIconCache.getAppIconReload()) {
+            Intent intent = new Intent();
+            ComponentName componentName = new ComponentName(LAUNCHER_UNREAD_SERVICE_PACKAGENAME,
+                    LAUNCHER_UNREAD_SERVICE_CLASSNAME);
+            intent.setComponent(componentName);
+            final Intent eintent = new Intent(Utilities.
+                    createExplicitFromImplicitIntent(this, intent));
+            bindService(eintent, mConnection, Context.BIND_AUTO_CREATE);
         }
     }
 
@@ -864,6 +957,11 @@ public class Launcher extends Activity
                 Toast.makeText(this, getString(R.string.msg_no_phone_permission,
                         getString(R.string.app_name)), Toast.LENGTH_SHORT).show();
             }
+        } else if(requestCode == PERMISSION_REQUEST_CODE_LOCATION){
+            if (grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                notifyWFCOnlyIfPermissionGranted();
+            }
         }
         if (mLauncherCallbacks != null) {
             mLauncherCallbacks.onRequestPermissionsResult(requestCode, permissions,
@@ -974,6 +1072,7 @@ public class Launcher extends Activity
         if (mOnResumeState == State.WORKSPACE) {
             showWorkspace(false);
         } else if (mOnResumeState == State.APPS) {
+            mWorkspace.setVisibility(View.INVISIBLE);
             boolean launchedFromApp = (mWaitingForResume != null);
             // Don't update the predicted apps if the user is returning to launcher in the apps
             // view after launching an app, as they may be depending on the UI to be static to
@@ -1071,6 +1170,16 @@ public class Launcher extends Activity
 
         if (mLauncherCallbacks != null) {
             mLauncherCallbacks.onResume();
+        }
+
+        // Notify that Home or Idle Screen is being started or resumed
+        Intent idleScreenIntent = new Intent(CAT_IDLE_SCREEN_ACTION);
+        idleScreenIntent.putExtra("SCREEN_IDLE",true);
+        Log.d(TAG,"Broadcasting Home Idle Screen Intent ...");
+        sendBroadcast(idleScreenIntent);
+        if(LauncherAppState.isShowWFCNotification()) {
+            mIsNotificationPopNeeded = true;
+            notifyWFCOnlyIfPermissionGranted();
         }
     }
 
@@ -1297,6 +1406,12 @@ public class Launcher extends Activity
         State state = intToState(savedState.getInt(RUNTIME_STATE, State.WORKSPACE.ordinal()));
         if (state == State.APPS || state == State.WIDGETS) {
             mOnResumeState = state;
+        }
+
+        restoreFromHideMode = savedState.getBoolean(RUNTIME_STATE_HIDE_APP_MODE, false);
+        if (restoreFromHideMode) {
+            mHideApps = (List<HideAppInfo>) savedState.
+                    getSerializable(RUNTIME_STATE_HIDE_APPS_INFO);
         }
 
         int currentScreen = savedState.getInt(RUNTIME_STATE_CURRENT_SCREEN,
@@ -1934,6 +2049,10 @@ public class Launcher extends Activity
             }
         }
 
+        if (null != mAppsView) {
+            mAppsView.dismissPopupWindow();
+        }
+
         if (DEBUG_RESUME_TIME) {
             Log.d(TAG, "Time spent in onNewIntent: " + (System.currentTimeMillis() - startTime));
         }
@@ -1955,6 +2074,7 @@ public class Launcher extends Activity
         // know as it's not null)
         if (isWorkspaceLoading() && mSavedState != null) {
             outState.putAll(mSavedState);
+            saveAllAppInstanceState(outState);
             return;
         }
 
@@ -1965,6 +2085,9 @@ public class Launcher extends Activity
         super.onSaveInstanceState(outState);
 
         outState.putInt(RUNTIME_STATE, mState.ordinal());
+
+        saveAllAppInstanceState(outState);
+
         // We close any open folder since it will not be re-opened, and we need to make sure
         // this state is reflected.
         closeFolder(false);
@@ -1988,6 +2111,14 @@ public class Launcher extends Activity
 
         if (mLauncherCallbacks != null) {
             mLauncherCallbacks.onSaveInstanceState(outState);
+        }
+    }
+
+    private void saveAllAppInstanceState(Bundle outState) {
+        outState.putBoolean(RUNTIME_STATE_HIDE_APP_MODE, mAppsView.getHideAppsMode());
+        if (mAppsView.getHideAppsMode()) {
+            outState.putSerializable(RUNTIME_STATE_HIDE_APPS_INFO,
+                    (Serializable) mAppsView.getApps().getHideApps());
         }
     }
 
@@ -2033,6 +2164,9 @@ public class Launcher extends Activity
 
         if (mLauncherCallbacks != null) {
             mLauncherCallbacks.onDestroy();
+        }
+        if (LauncherAppState.isShowWFCNotification() && (null != mTelephonyManager)) {
+            mTelephonyManager.listen(mSignalStrengthListener, PhoneStateListener.LISTEN_NONE);
         }
     }
 
@@ -2484,6 +2618,13 @@ public class Launcher extends Activity
         }
 
         if (isAppsViewVisible()) {
+            if (null != mAppsView && mAppsView.getHideAppsMode()) {
+                mAppsView.exitHideMode();
+                mAppsView.clearTempHideAppList();
+                mAppsView.readHideAppFunction();
+                mAppsView.getApps().removeHideapp();
+                return;
+            }
             showWorkspace(true);
         } else if (isWidgetsViewVisible())  {
             showOverviewMode(true);
@@ -2556,7 +2697,35 @@ public class Launcher extends Activity
         } else if (v == mAllAppsButton) {
             onClickAllAppsButton(v);
         } else if (tag instanceof AppInfo) {
-            startAppShortcutOrInfoActivity(v);
+            if (mAppsView.getHideAppsMode()) {
+                int pos = ((BubbleTextView) v).getPosition();
+                if (AllAppsGridAdapter.mHideMap.get(pos) == View.VISIBLE) {
+                    AllAppsGridAdapter.mHideMap.put(pos, View.INVISIBLE);
+                } else {
+                    AllAppsGridAdapter.mHideMap.put(pos, View.VISIBLE);
+                }
+                AppInfo info = (AppInfo) tag;
+                HideAppInfo hideinfo = new HideAppInfo();
+                hideinfo.setComponentPackage(info.componentName.getPackageName());
+                hideinfo.setComponentClass(info.componentName.getClassName());
+                List<HideAppInfo> hidelist = mAppsView.getApps().getHideApps();
+
+                boolean isExit = false;
+                for (HideAppInfo hinfo : hidelist) {
+                    if (hideinfo.getComponentPackage().equals(hinfo.getComponentPackage())
+                            && hideinfo.getComponentClass().equals(hinfo.getComponentClass())) {
+                        isExit = true;
+                        hidelist.remove(hinfo);
+                        break;
+                    }
+                }
+                if (isExit == false) {
+                    hidelist.add(hideinfo);
+                }
+                mAppsView.getAdapter().notifyDataSetChanged();
+            } else {
+                startAppShortcutOrInfoActivity(v);
+            }
         } else if (tag instanceof LauncherAppWidgetInfo) {
             if (v instanceof PendingAppWidgetHostView) {
                 onClickPendingWidget((PendingAppWidgetHostView) v);
@@ -3269,7 +3438,11 @@ public class Launcher extends Activity
                 mWorkspace.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS,
                         HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
                 if (mWorkspace.isInOverviewMode()) {
-                    mWorkspace.startReordering(v);
+                    long screenId = mWorkspace.getIdForScreen((CellLayout)v);
+
+                    if (screenId != mWorkspace.EXTRA_EMPTY_SCREEN_ID) {
+                        mWorkspace.startReordering(v);
+                    }
                 } else {
                     showOverviewMode(true);
                 }
@@ -3387,8 +3560,23 @@ public class Launcher extends Activity
      * @return whether or not the Launcher state changed.
      */
     boolean showWorkspace(int snapToPage, boolean animated, Runnable onCompleteRunnable) {
+
         boolean changed = mState != State.WORKSPACE ||
                 mWorkspace.getState() != Workspace.State.NORMAL;
+        int childCount = mWorkspace.getChildCount();
+
+        if (changed) {
+            mWorkspace.removeAddScreen();
+            for (int i = 0; i < childCount; i++) {
+                CellLayout cl = (CellLayout) mWorkspace.getChildAt(i);
+                long screenId = mWorkspace.getIdForScreen(cl);
+                if (mEmptyScreenList.indexOf(screenId) != -1) {
+                    removeDeleteScreenLayout(cl);
+                }
+            }
+        }
+        mEmptyScreenList.clear();
+
         if (changed) {
             mWorkspace.setVisibility(View.VISIBLE);
             mStateTransitionAnimation.startAnimationToWorkspace(mState, mWorkspace.getState(),
@@ -3422,6 +3610,85 @@ public class Launcher extends Activity
         showOverviewMode(animated, false);
     }
 
+    public void deleteScreenLayout(CellLayout cell) {
+        if (null == cell) { return; }
+
+        final CellLayout emptyscreen = cell;
+        LayoutInflater inflater = LayoutInflater.from(this);
+        final View contentview = (View)inflater.inflate(
+                R.layout.delete_screen_button, cell, false);
+
+        View deletecontainer = (View)contentview.findViewById(R.id.delete_container);
+        TextView deleteScreenButton = (TextView)contentview.findViewById(R.id.delete_btn);
+        Drawable d = getResources().getDrawable(R.drawable.screen_close);
+
+        deleteScreenButton.setBackgroundDrawable(d);
+        final CellLayout.LayoutParams lp = new CellLayout.LayoutParams(
+                mDeviceProfile.inv.numColumns - 1, 0, 1, 1);
+        emptyscreen.addViewToCellLayout(contentview, -1, contentview.getId(), lp, false);
+
+        deletecontainer.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View arg0) {
+                mWorkspace.deleteScreenLayoutTransitions(emptyscreen);
+                long screenId = mWorkspace.getIdForScreen(emptyscreen);
+                ArrayList<Long> workspaceScreens = mWorkspace.getScreenOrder();
+
+                workspaceScreens.remove(screenId);
+                mWorkspace.removeView(emptyscreen);
+                getModel().updateWorkspaceScreenOrder(mContext, workspaceScreens);
+                mEmptyScreenList.remove(screenId);
+                removeDeleteScreenLayout(emptyscreen);
+            }
+        });
+    }
+
+    public void removeDeleteScreenLayout(CellLayout cell) {
+        if (null == cell) { return; }
+
+        View view = cell.getChildAt(mDeviceProfile.inv.numColumns - 1, 0);
+        cell.removeView(view);
+    }
+
+    public void AddScreenLayout() {
+        if (null == mWorkspace
+                || (null != mWorkspace && mWorkspace.getChildCount() - 1 < 0)) {
+            return;
+        }
+
+        final CellLayout addScreen = (CellLayout) mWorkspace.
+                getChildAt(mWorkspace.getChildCount() - 1);
+        LayoutInflater inflater = LayoutInflater.from(this);
+        final View contentview = (View)inflater.inflate(
+                R.layout.add_screen_button, addScreen, false);
+
+        View add_container = (View) contentview.findViewById(R.id.add_btn_container);
+        TextView addScreenButton = (TextView) contentview.findViewById(R.id.add_btn);
+        Drawable d = getResources().getDrawable(R.drawable.screen_add);
+        addScreenButton.setBackgroundDrawable(d);
+
+        final CellLayout.LayoutParams lp = new CellLayout.LayoutParams(
+                1, 1, mDeviceProfile.inv.numColumns - 2, mDeviceProfile.inv.numRows - 2);
+        addScreen.addViewToCellLayout(contentview, -1, contentview.getId(), lp, true);
+
+        add_container.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View arg0) {
+                mWorkspace.commitExtraEmptyScreen();
+                mWorkspace.saveWorkspaceScreenToDb((CellLayout) mWorkspace.
+                        getChildAt(mWorkspace.getChildCount() - 1));
+                mWorkspace.addExtraEmptyScreen();
+
+                int finalIndex = mWorkspace.getChildCount() - 1;
+                CellLayout addscreen = (CellLayout) mWorkspace.getChildAt(finalIndex);
+                CellLayout emptyscreen = (CellLayout) mWorkspace.getChildAt(finalIndex - 1);
+
+                emptyscreen.removeAllViews();
+                addscreen.addViewToCellLayout(contentview, -1, contentview.getId(), lp, true);
+                showOverviewMode(true);
+            }
+        });
+    }
     /**
      * Shows the overview button, and if {@param requestButtonFocus} is set, will force the focus
      * onto one of the overview panel buttons.
@@ -3439,12 +3706,33 @@ public class Launcher extends Activity
                 }
             };
         }
+
+        mWorkspace.addExtraEmptyScreen();
+        AddScreenLayout();
         mWorkspace.setVisibility(View.VISIBLE);
+
+        int childCount = mWorkspace.getChildCount();
+        for (int i = 0; i < childCount; i++) {
+            CellLayout cl = (CellLayout) mWorkspace.getChildAt(i);
+            long screenId = mWorkspace.getIdForScreen(cl);
+
+            if (null != cl && null != cl.getShortcutsAndWidgets()
+                    && cl.getShortcutsAndWidgets().getChildCount() == 0) {
+
+                deleteScreenLayout(cl);
+                mEmptyScreenList.add(screenId);
+            }
+        }
+
         mStateTransitionAnimation.startAnimationToWorkspace(mState, mWorkspace.getState(),
                 Workspace.State.OVERVIEW,
                 WorkspaceStateTransitionAnimation.SCROLL_TO_CURRENT_PAGE, animated,
                 postAnimRunnable);
         mState = State.WORKSPACE;
+    }
+
+    public ArrayList<Long> getEmptyScreenList(){
+        return mEmptyScreenList;
     }
 
     /**
@@ -3943,6 +4231,7 @@ public class Launcher extends Activity
 
             workspace.addInScreenFromBind(view, item.container, item.screenId, item.cellX,
                     item.cellY, 1, 1);
+            getWorkspace().setHideAppToWorkspace(false);
             if (animateIcons) {
                 // Animate all the applications up now
                 view.setAlpha(0f);
@@ -4179,7 +4468,8 @@ public class Launcher extends Activity
         }
         if (mSavedState != null) {
             if (!mWorkspace.hasFocus()) {
-                mWorkspace.getChildAt(mWorkspace.getCurrentPage()).requestFocus();
+                View v = mWorkspace.getChildAt(mWorkspace.getCurrentPage());
+                if (v != null) v.requestFocus();
             }
             mSavedState = null;
         }
@@ -4305,6 +4595,14 @@ public class Launcher extends Activity
         if (mLauncherCallbacks != null) {
             mLauncherCallbacks.bindAllApplications(apps);
         }
+        if (restoreFromHideMode) {
+            mAppsView.enterHideAppsMode();
+            mAppsView.getApps().setHideApps(mHideApps);
+            if (mOnResumeState == State.APPS) {
+                mAppsView.getAdapter().notifyDataSetChanged();
+            }
+        }
+        restoreFromHideMode = false;
     }
 
     /**
@@ -4767,6 +5065,98 @@ public class Launcher extends Activity
         return icon;
     }
 
+    private boolean isShowWifiCallNotification() {
+        boolean wifiAvailableNotConnected = false;
+        boolean wifiCallTurnOn = Settings.Global.getInt(getContentResolver(),
+                WIFI_CALL_TURNON, WIFI_CALL_TURN_OFF) == 1 ? true :false;
+
+        ConnectivityManager conManager = (ConnectivityManager)
+                getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo wifiNetworkInfo = conManager.getNetworkInfo(ConnectivityManager.TYPE_WIFI);
+        if (wifiNetworkInfo.isAvailable() && !wifiNetworkInfo.isConnected()) {
+            wifiAvailableNotConnected = true;
+        }
+
+        return wifiCallTurnOn && wifiAvailableNotConnected && !isCellularNetworkAvailable();
+    }
+
+    private boolean isCellularNetworkAvailable() {
+        TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+        List<CellInfo> cellInfoList = tm.getAllCellInfo();
+
+        if (cellInfoList != null) {
+            for (CellInfo cellinfo : cellInfoList) {
+                if (cellinfo.isRegistered()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void popConnectWifiCallNotification() {
+        if ((mState == State.WORKSPACE) && mIsNotificationPopNeeded
+                && isShowWifiCallNotification()) {
+            if(LOGD) {
+                Log.d(TAG, "popConnectWifiCallNotification:" + "send wfc notification");
+            }
+            final NotificationManager notiManager =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+
+            Intent intent = new Intent();
+            intent.setAction(android.provider.Settings.ACTION_WIFI_SETTINGS);
+            PendingIntent pendingIntent =
+                    PendingIntent.getActivity(
+                            this, NOTIFICATION_WIFI_CALL_ID,
+                            intent, PendingIntent.FLAG_UPDATE_CURRENT);
+
+            Notification.Builder builder = new Notification.Builder(this);
+            builder.setOngoing(false);
+            builder.setWhen(0);
+            builder.setContentIntent(pendingIntent);
+            builder.setAutoCancel(true);
+            builder.setSmallIcon(R.drawable.wifi_calling_on_notification);
+            builder.setContentTitle(
+                    getResources().getString(R.string.alert_user_connect_to_wifi_for_call_title));
+            builder.setContentText(
+                    getResources().getString(R.string.alert_user_connect_to_wifi_for_call_text));
+            notiManager.notify(NOTIFICATION_WIFI_CALL_ID, builder.build());
+
+            mHandler.postDelayed(new Thread() {
+                @Override
+                public void run() {
+                    notiManager.cancel(NOTIFICATION_WIFI_CALL_ID);
+                }
+            }, 5000);
+            mIsNotificationPopNeeded = false;
+        }
+    }
+
+    private void notifyWFCOnlyIfPermissionGranted() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) !=
+                PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.ACCESS_COARSE_LOCATION},
+                    PERMISSION_REQUEST_CODE_LOCATION);
+        } else {
+            popConnectWifiCallNotification();
+        }
+    }
+
+    private class SignalStrengthListener extends PhoneStateListener {
+
+        @Override
+        public void onSignalStrengthsChanged(SignalStrength signalStrength) {
+            super.onSignalStrengthsChanged(signalStrength);
+            int level = signalStrength.getLevel();
+            if (level <= SIGNAL_STRENGTH_POOR) {
+                notifyWFCOnlyIfPermissionGranted();
+                if(LOGD) {
+                    Log.d(TAG, "onSignalStrengthsChanged: level=" + level+", pup notification");
+                }
+            }
+        }
+    };
+
     /**
      * Prints out out state for debugging.
      */
@@ -4841,6 +5231,10 @@ public class Launcher extends Activity
 
     public static HashMap<String, CustomAppWidget> getCustomAppWidgets() {
         return sCustomAppWidgets;
+    }
+
+    public void updateTitleDb(ShortcutInfo info, String title) {
+        mModel.updateShortcutTitle(this, info, title);
     }
 
     public void dumpLogsToLocalData() {

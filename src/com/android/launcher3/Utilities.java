@@ -40,8 +40,11 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.Paint.Style;
 import android.graphics.PaintFlagsDrawFilter;
 import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.PaintDrawable;
@@ -68,6 +71,7 @@ import com.android.launcher3.util.IconNormalizer;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.Executor;
@@ -153,6 +157,43 @@ public final class Utilities {
         return getPrefs(context).getBoolean(ALLOW_ROTATION_PREFERENCE_KEY, allowRotationPref);
     }
 
+   static Bitmap createIconBitmapUnreadInfo(Context context, Bitmap b, int count) {
+
+       int textureWidth = b.getWidth();
+       final Resources resources = context.getResources();
+       final Canvas canvas = sCanvas;
+       canvas.setBitmap(b);
+
+       float textsize = resources.getDimension(R.dimen.infomation_count_textsize);
+       Paint countPaint = new Paint(Paint.ANTI_ALIAS_FLAG|Paint.DEV_KERN_TEXT_FLAG);
+       countPaint.setColor(Color.WHITE);
+       countPaint.setTextSize(textsize);
+
+       String text = String.valueOf(count);
+       if (count >= 1000) {
+           text = "999+";
+       }
+
+       float count_hight = resources.getDimension(R.dimen.infomation_count_height);
+       float padding = resources.getDimension(R.dimen.infomation_count_padding);
+       float radius = resources.getDimension(R.dimen.infomation_count_circle_radius);
+       int  textwidth = (int) (countPaint.measureText(text) + 1);
+       float width =textwidth + padding * 2;
+       width = Math.max(width, resources.getDimensionPixelSize(R.dimen.infomation_count_min_width));
+
+       RectF rect = new RectF(textureWidth - width -1, 1, textureWidth - 1, count_hight + 1);
+       Paint paint = new Paint();
+       paint.setAntiAlias(true);
+       paint.setColor(resources.getColor(R.color.infomation_count_circle_color));
+       canvas.drawRoundRect(rect , radius, radius, paint);
+
+       float x = textureWidth - (width + textwidth ) / 2 - 1;
+       float y = textsize;
+       canvas.drawText(text, x, y, countPaint);
+
+       return b;
+    }
+
     public static Bitmap createIconBitmap(Cursor c, int iconIndex, Context context) {
         byte[] data = c.getBlob(iconIndex);
         try {
@@ -209,6 +250,34 @@ public final class Utilities {
         float scale = FeatureFlags.LAUNCHER3_ICON_NORMALIZATION ?
                 IconNormalizer.getInstance().getScale(icon) : 1;
         Bitmap bitmap = createIconBitmap(icon, context, scale);
+        if (Utilities.ATLEAST_LOLLIPOP && user != null
+                && !UserHandleCompat.myUserHandle().equals(user)) {
+            BitmapDrawable drawable = new FixedSizeBitmapDrawable(bitmap);
+            Drawable badged = context.getPackageManager().getUserBadgedIcon(
+                    drawable, user.getUser());
+            if (badged instanceof BitmapDrawable) {
+                return ((BitmapDrawable) badged).getBitmap();
+            } else {
+                return createIconBitmap(badged, context);
+            }
+        } else {
+            return bitmap;
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    public static Bitmap createBadgedIconBitmap(
+            Drawable icon, UserHandleCompat user, Context context, int count) {
+        float scale = FeatureFlags.LAUNCHER3_ICON_NORMALIZATION ?
+                IconNormalizer.getInstance().getScale(icon) : 1;
+
+        Bitmap bitmap = createIconBitmap(icon, context, scale);
+
+        // create the unread icon's info here
+        if (isUnreadCountEnabled(context) && count > 0) {
+            bitmap = createIconBitmapUnreadInfo(context, bitmap, count);
+        }
+
         if (Utilities.ATLEAST_LOLLIPOP && user != null
                 && !UserHandleCompat.myUserHandle().equals(user)) {
             BitmapDrawable drawable = new FixedSizeBitmapDrawable(bitmap);
@@ -834,5 +903,36 @@ public final class Utilities {
         public int getIntrinsicWidth() {
             return getBitmap().getWidth();
         }
+    }
+
+    public static boolean isUnreadCountEnabled(Context context) {
+        boolean result  = context.getResources().getBoolean(
+                R.bool.config_launcher_show_unread_number);
+        return result;
+    }
+
+    public static Intent createExplicitFromImplicitIntent(Context context, Intent implicitIntent) {
+        // Retrieve all services that can match the given intent
+        PackageManager pm = context.getPackageManager();
+        List<ResolveInfo> resolveInfo = pm.queryIntentServices(implicitIntent, 0);
+
+        // Make sure only one match was found
+        if (resolveInfo == null || resolveInfo.size() != 1) {
+            return null;
+        }
+
+        // Get component info and create ComponentName
+        ResolveInfo serviceInfo = resolveInfo.get(0);
+        String packageName = serviceInfo.serviceInfo.packageName;
+        String className = serviceInfo.serviceInfo.name;
+        ComponentName component = new ComponentName(packageName, className);
+
+        // Create a new intent. Use the old one for extras and such reuse
+        Intent explicitIntent = new Intent(implicitIntent);
+
+        // Set the component to be explicit
+        explicitIntent.setComponent(component);
+
+        return explicitIntent;
     }
 }

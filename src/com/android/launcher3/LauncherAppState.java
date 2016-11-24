@@ -47,6 +47,12 @@ public class LauncherAppState {
 
     private static LauncherAppState INSTANCE;
 
+    private static boolean mHaveCustomWorkspace;
+    private static boolean mCustomizeBrowserIcon;
+    private static boolean mCustomizeShortcutRename;
+    private static boolean mIsShowWFCNotification;
+    private static boolean mConfigTetherHotspotShortcut;
+
     private InvariantDeviceProfile mInvariantDeviceProfile;
 
     private LauncherAccessibilityDelegate mAccessibilityDelegate;
@@ -83,6 +89,16 @@ public class LauncherAppState {
         if (TestingUtils.MEMORY_DUMP_ENABLED) {
             TestingUtils.startTrackingMemory(sContext);
         }
+        mHaveCustomWorkspace = sContext.getResources().getBoolean(
+                R.bool.config_launcher_customWorkspace);
+        mCustomizeBrowserIcon = sContext.getResources().getBoolean(
+                R.bool.config_regional_customize_default_browser_icon);
+        mCustomizeShortcutRename = sContext.getResources().getBoolean(
+                R.bool.config_regional_customize_rename);
+        mIsShowWFCNotification = sContext.getResources().getBoolean(
+                R.bool.config_show_wfc_notification);
+        mConfigTetherHotspotShortcut = sContext.getResources().getBoolean(
+                R.bool.config_tether_hotspot_shortcut);
 
         mInvariantDeviceProfile = new InvariantDeviceProfile(sContext);
         mIconCache = new IconCache(sContext, mInvariantDeviceProfile);
@@ -109,6 +125,12 @@ public class LauncherAppState {
 
         sContext.registerReceiver(
                 new WallpaperChangedReceiver(), new IntentFilter(Intent.ACTION_WALLPAPER_CHANGED));
+
+        filter = new IntentFilter();
+        if (Utilities.isUnreadCountEnabled(sContext)) {
+            filter.addAction(LauncherModel.ACTION_UNREAD_CHANGED);
+            sContext.registerReceiver(mModel, filter);
+        }
     }
 
     /**
@@ -148,6 +170,26 @@ public class LauncherAppState {
 
     public LauncherModel getModel() {
         return mModel;
+    }
+
+    public static boolean isCustomWorkspace() {
+        return mHaveCustomWorkspace;
+    }
+
+    public static boolean isCustomizeBrowserIcon() {
+        return mCustomizeBrowserIcon;
+    }
+
+    public static boolean isShowWFCNotification() {
+        return mIsShowWFCNotification;
+    }
+
+    public static boolean isCustomizeShortcutRname() {
+        return mCustomizeShortcutRename;
+    }
+
+    public static boolean isConfigTetherHotspotShortcut() {
+        return mConfigTetherHotspotShortcut;
     }
 
     static void setLauncherProvider(LauncherProvider provider) {
